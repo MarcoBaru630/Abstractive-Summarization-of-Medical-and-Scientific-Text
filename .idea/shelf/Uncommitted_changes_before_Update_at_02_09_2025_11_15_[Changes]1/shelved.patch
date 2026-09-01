@@ -1,0 +1,681 @@
+Index: src/preprocessing.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.BaseRevisionTextPatchEP
+<+>import pandas as pd\r\nimport re\r\nfrom datasets import Dataset\r\nfrom transformers import AutoTokenizer, AutoModelForSeq2SeqLM\r\nfrom sklearn.model_selection import train_test_split\r\nfrom tqdm import tqdm\r\nfrom src.settings import *\r\n\r\nDATA_DIR = BASE_DIR / \"data\"\r\n# 1. Carica modello e tokenizer\r\nprint('Loading tokenizer...')\r\ntokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)\r\nprint('Loading model...')\r\nmodel = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)\r\n\r\n\r\ndef slicing_logic(row) -> bool:\r\n    \"\"\"\r\n    slicing logic for pandas dataframe, leaves only entries with less than 1500 word.\r\n    needed to reduce the dimentions of the dataset and reduce the number of tokens required.\r\n    :param row:\r\n    :return: bool\r\n    \"\"\"\r\n    if not type(row['article']) is str: return False\r\n\r\n    length = len(row['article'].split(' '))\r\n    if  100 < length < 1000:\r\n        return True\r\n    return False\r\n\r\n\r\ndef preprocess_token(batch):\r\n    model_inputs = tokenizer(\r\n        batch[\"article\"],\r\n        max_length=MAX_INPUT_LENGTH,\r\n        truncation=True,\r\n        padding=\"max_length\"\r\n    )\r\n    labels = tokenizer(\r\n        text_target=batch[\"abstract\"],\r\n        max_length=MAX_TARGET_LENGTH,\r\n        truncation=True,\r\n        padding=\"max_length\"\r\n    )\r\n    model_inputs[\"labels\"] = labels[\"input_ids\"]\r\n    return model_inputs\r\n\r\n\r\ndef concat_dataset():\r\n    \"\"\"Dataset was already split and kaggle load was not working\"\"\"\r\n\r\n    df_1 = pd.read_csv(DATA_DIR / 'train.csv')\r\n    df_2 = pd.read_csv(DATA_DIR / 'validation.csv')\r\n    df_3 = pd.read_csv(DATA_DIR / 'test.csv')\r\n    _df = pd.concat([df_1, df_2, df_3])\r\n    _df.to_csv(DATA_DIR / 'dataset.csv', index=False)\r\n\r\ndef load_csv(path, chunk_size:int) -> pd.DataFrame:\r\n    total_lines = 134 # known form dataset description\r\n    chunks = []\r\n    with pd.read_csv(path, header=0, dtype=str, chunksize=chunk_size) as reader:\r\n        for chunk in tqdm(reader, total=total_lines, desc='Loading Data'):\r\n            chunks.append(chunk)\r\n\r\n    return pd.concat(chunks, ignore_index=True)\r\n\r\n\r\n# ====== FUNZIONE: Pulizia testo ======\r\ndef clean_scientific_text(text):\r\n    if not isinstance(text, str):\r\n        return \"\"\r\n    # Rimuove spazi multipli\r\n    text = re.sub(r'\\s+', ' ', text)\r\n    # Rimuove riferimenti tipo [1], [12], ecc.\r\n    text = re.sub(r'\\[\\d+\\]', '', text)\r\n    # Rimuove caratteri non utili (tranne punteggiatura base)\r\n    text = re.sub(r'[^a-zA-Z0-9.,;:!?\\'\\\"()\\s-]', '', text)\r\n    # Elimina spazi iniziali/finali\r\n    return text.strip()\r\n\r\n\r\nclass Preprocessor:\r\n    def __init__(self):\r\n\r\n        # loading tokenized dataset from cache if available\r\n        if CACHED:\r\n            print(\"Loading cached dataset...\")\r\n            self.tokenized_paths = {\r\n                'train' : DATA_DIR / 'train_tokenized',\r\n                'validation' : DATA_DIR / 'validation_tokenized',\r\n                'test' : DATA_DIR / 'test_tokenized',\r\n            }\r\n\r\n            if all(path.exists() for path in self.tokenized_paths.values()):\r\n                self.splits = {\r\n                    name: Dataset.load_from_disk(path)\r\n                    for name, path in self.tokenized_paths.items()\r\n                }\r\n\r\n                print(self.splits)\r\n                return\r\n            else:\r\n                print(\"Cached data was not found. Creating new one...\")\r\n\r\n        # 2. Carica dataset concatenato\r\n        print(\"\\rLoading dataset...\", end='')\r\n        if DEBUG:\r\n            df = pd.read_csv(DATA_DIR / 'dataset.csv', header=0, dtype=str, nrows=2000)\r\n        else:\r\n            df = load_csv(DATA_DIR / 'dataset.csv', 1000)\r\n\r\n\r\n        print(\"Reducing dataset...\")\r\n        df_filtered = df[df.apply(slicing_logic, axis=1)]\r\n        df_filtered.reset_index(drop=True, inplace=True)\r\n\r\n        # 3. Pulizia testo\r\n        for chunk in tqdm(range(len(df_filtered)), desc='Cleaning Dataset'):\r\n            df_filtered.at[chunk, 'article'] = clean_scientific_text(df_filtered.at[chunk, 'article'])\r\n            df_filtered.at[chunk, 'abstract'] = clean_scientific_text(df_filtered.at[chunk, 'abstract'])\r\n\r\n        df_clean = df_filtered[df_filtered.apply(slicing_logic, axis=1)]\r\n        df_clean.reset_index(drop=True, inplace=True)\r\n        print(df_clean.shape)\r\n\r\n\r\n        # 4. Conversione in Dataset HuggingFace\r\n        self.dataset = Dataset.from_pandas(df_filtered)\r\n        print(self.dataset)\r\n\r\n        # 5. Split train (80%) / temp (20%)\r\n        print('\\rSplitting dataset...', end='')\r\n        self.split_dataset = self.dataset.train_test_split(test_size=0.2, seed=SEED)\r\n\r\n        # 6. Split temp in validation (10%) / test (10%)\r\n        self.temp_split = self.split_dataset['test'].train_test_split(test_size=0.5, seed=SEED)\r\n\r\n        self.dataset_splits = {\r\n            'train': self.split_dataset['train'],\r\n            'validation': self.temp_split['train'],\r\n            'test': self.temp_split['test']\r\n        }\r\n\r\n        print('split done')\r\n        # 8. Tokenizzazione di tutti gli split\r\n        self.splits = {}\r\n        for split_name, split_data in self.dataset_splits.items():\r\n            print('Splitting {}...'.format(split_name))\r\n            self.splits[split_name] = split_data.map(preprocess_token, batched=True, remove_columns=['article', 'abstract'])\r\n            print(\"Caching split {}...\".format(split_name))\r\n            self.splits[split_name].save_to_disk(DATA_DIR / f'{split_name}_tokenized')\r\n        print(\"✅ Tokenizzazione completata per train/val/test\")\r\n\r\n    def train(self):\r\n        \"\"\"\r\n            :return: tokenized train split\r\n        \"\"\"\r\n        return self.splits['train']\r\n\r\n    def eval(self):\r\n        \"\"\"\r\n        :return: tokenized validation split\r\n        \"\"\"\r\n        return self.splits['validation']\r\n\r\n    def test(self):\r\n        \"\"\"\r\n        :return: tokenized test split\r\n        \"\"\"\r\n        return self.splits['test']\r\n\r\n    def save_splits(self):\r\n        # 7. Salvataggio CSV puliti\r\n        for split_name, split_data in self.dataset_splits.items():\r\n            split_df = pd.DataFrame(split_data)\r\n            split_df.to_csv(DATA_DIR / f\"{split_name}_clean.csv\", index=False)\r\n            print(f\"✅ Salvato {split_name}_clean.csv con {len(split_df)} righe\")\r\n\r\n\r\n\r\n\r\nif __name__ == '__main__':\r\n    p_test = Preprocessor()
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/preprocessing.py b/src/preprocessing.py
+--- a/src/preprocessing.py	(revision 90da7b09f610203b20c9fdeac27b31900d373ad4)
++++ b/src/preprocessing.py	(date 1756027049142)
+@@ -180,4 +180,6 @@
+ 
+ 
+ if __name__ == '__main__':
+-    p_test = Preprocessor()
+\ No newline at end of file
++    concat_dataset()
++    p_test = Preprocessor()
++    p_test.save_splits()
+\ No newline at end of file
+Index: .idea/workspace.xml
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.BaseRevisionTextPatchEP
+<+><?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n<project version=\"4\">\r\n  <component name=\"AutoImportSettings\">\r\n    <option name=\"autoReloadType\" value=\"SELECTIVE\" />\r\n  </component>\r\n  <component name=\"ChangeListManager\">\r\n    <list default=\"true\" id=\"5b800ac8-4841-4f5e-b4d7-2ce2d271eeb7\" name=\"Changes\" comment=\"First commit\">\r\n      <change afterPath=\"$PROJECT_DIR$/src/Evaluate.py\" afterDir=\"false\" />\r\n      <change beforePath=\"$PROJECT_DIR$/.idea/workspace.xml\" beforeDir=\"false\" afterPath=\"$PROJECT_DIR$/.idea/workspace.xml\" afterDir=\"false\" />\r\n    </list>\r\n    <option name=\"SHOW_DIALOG\" value=\"false\" />\r\n    <option name=\"HIGHLIGHT_CONFLICTS\" value=\"true\" />\r\n    <option name=\"HIGHLIGHT_NON_ACTIVE_CHANGELIST\" value=\"false\" />\r\n    <option name=\"LAST_RESOLUTION\" value=\"IGNORE\" />\r\n  </component>\r\n  <component name=\"FileTemplateManagerImpl\">\r\n    <option name=\"RECENT_TEMPLATES\">\r\n      <list>\r\n        <option value=\"Python Script\" />\r\n      </list>\r\n    </option>\r\n  </component>\r\n  <component name=\"Git.Settings\">\r\n    <option name=\"PREVIOUS_COMMIT_AUTHORS\">\r\n      <list>\r\n        <option value=\"Brandon\" />\r\n      </list>\r\n    </option>\r\n    <option name=\"RECENT_GIT_ROOT_PATH\" value=\"$PROJECT_DIR$\" />\r\n  </component>\r\n  <component name=\"GitHubPullRequestSearchHistory\">{\r\n  &quot;lastFilter&quot;: {\r\n    &quot;state&quot;: &quot;OPEN&quot;,\r\n    &quot;assignee&quot;: &quot;BrandonTatani&quot;\r\n  }\r\n}</component>\r\n  <component name=\"GithubPullRequestsUISettings\"><![CDATA[{\r\n  \"selectedUrlAndAccountId\": {\r\n    \"url\": \"https://github.com/BrandonTatani/MLProject.git\",\r\n    \"accountId\": \"f1c596c8-9a77-4d68-9287-e1fd66e6d6fe\"\r\n  }\r\n}]]></component>\r\n  <component name=\"ProblemsViewState\">\r\n    <option name=\"selectedTabId\" value=\"CurrentFile\" />\r\n  </component>\r\n  <component name=\"ProjectColorInfo\">{\r\n  &quot;associatedIndex&quot;: 6\r\n}</component>\r\n  <component name=\"ProjectId\" id=\"30xsrxkVbnwzrtb4vA7DpOe3vrR\" />\r\n  <component name=\"ProjectViewState\">\r\n    <option name=\"hideEmptyMiddlePackages\" value=\"true\" />\r\n    <option name=\"showLibraryContents\" value=\"true\" />\r\n  </component>\r\n  <component name=\"PropertiesComponent\">{\r\n  &quot;keyToString&quot;: {\r\n    &quot;ModuleVcsDetector.initialDetectionPerformed&quot;: &quot;true&quot;,\r\n    &quot;Python.Main.executor&quot;: &quot;Run&quot;,\r\n    &quot;Python.eval_pre_train.executor&quot;: &quot;Run&quot;,\r\n    &quot;Python.main.executor&quot;: &quot;Run&quot;,\r\n    &quot;Python.preprocessing.executor&quot;: &quot;Run&quot;,\r\n    &quot;Python.settings.executor&quot;: &quot;Run&quot;,\r\n    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,\r\n    &quot;RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager&quot;: &quot;true&quot;,\r\n    &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,\r\n    &quot;git-widget-placeholder&quot;: &quot;master&quot;,\r\n    &quot;ignore.virus.scanning.warn.message&quot;: &quot;true&quot;,\r\n    &quot;node.js.detected.package.eslint&quot;: &quot;true&quot;,\r\n    &quot;node.js.detected.package.tslint&quot;: &quot;true&quot;,\r\n    &quot;node.js.selected.package.eslint&quot;: &quot;(autodetect)&quot;,\r\n    &quot;node.js.selected.package.tslint&quot;: &quot;(autodetect)&quot;,\r\n    &quot;nodejs_package_manager_path&quot;: &quot;npm&quot;,\r\n    &quot;settings.editor.selected.configurable&quot;: &quot;editor.preferences.fonts.default&quot;,\r\n    &quot;vue.rearranger.settings.migration&quot;: &quot;true&quot;\r\n  }\r\n}</component>\r\n  <component name=\"RecentsManager\">\r\n    <key name=\"MoveFile.RECENT_KEYS\">\r\n      <recent name=\"C:\\Users\\brand\\Code\\MLProject\\src\" />\r\n      <recent name=\"C:\\Users\\brand\\Code\\MLProject\" />\r\n    </key>\r\n  </component>\r\n  <component name=\"SharedIndexes\">\r\n    <attachedChunks>\r\n      <set>\r\n        <option value=\"bundled-js-predefined-d6986cc7102b-e03c56caf84a-JavaScript-PY-252.23892.515\" />\r\n        <option value=\"bundled-python-sdk-7e47963ff851-f0eec537fc84-com.jetbrains.pycharm.pro.sharedIndexes.bundled-PY-252.23892.515\" />\r\n      </set>\r\n    </attachedChunks>\r\n  </component>\r\n  <component name=\"SpellCheckerSettings\" RuntimeDictionaries=\"0\" Folders=\"0\" CustomDictionaries=\"0\" DefaultDictionary=\"application-level\" UseSingleDictionary=\"true\" transferred=\"true\" />\r\n  <component name=\"TaskManager\">\r\n    <task active=\"true\" id=\"Default\" summary=\"Default task\">\r\n      <changelist id=\"5b800ac8-4841-4f5e-b4d7-2ce2d271eeb7\" name=\"Changes\" comment=\"\" />\r\n      <created>1754580762167</created>\r\n      <option name=\"number\" value=\"Default\" />\r\n      <option name=\"presentableId\" value=\"Default\" />\r\n      <updated>1754580762167</updated>\r\n      <workItem from=\"1754580763247\" duration=\"3806000\" />\r\n      <workItem from=\"1755783827998\" duration=\"3027000\" />\r\n    </task>\r\n    <task id=\"LOCAL-00001\" summary=\"First commit\">\r\n      <option name=\"closed\" value=\"true\" />\r\n      <created>1754581730636</created>\r\n      <option name=\"number\" value=\"00001\" />\r\n      <option name=\"presentableId\" value=\"LOCAL-00001\" />\r\n      <option name=\"project\" value=\"LOCAL\" />\r\n      <updated>1754581730636</updated>\r\n    </task>\r\n    <option name=\"localTasksCounter\" value=\"2\" />\r\n    <servers />\r\n  </component>\r\n  <component name=\"TypeScriptGeneratedFilesManager\">\r\n    <option name=\"version\" value=\"3\" />\r\n  </component>\r\n  <component name=\"Vcs.Log.Tabs.Properties\">\r\n    <option name=\"TAB_STATES\">\r\n      <map>\r\n        <entry key=\"MAIN\">\r\n          <value>\r\n            <State />\r\n          </value>\r\n        </entry>\r\n      </map>\r\n    </option>\r\n  </component>\r\n  <component name=\"VcsManagerConfiguration\">\r\n    <MESSAGE value=\"First commit\" />\r\n    <option name=\"LAST_COMMIT_MESSAGE\" value=\"First commit\" />\r\n  </component>\r\n  <component name=\"XDebuggerManager\">\r\n    <breakpoint-manager>\r\n      <breakpoints>\r\n        <line-breakpoint enabled=\"true\" suspend=\"THREAD\" type=\"python-line\">\r\n          <url>file://$PROJECT_DIR$/Main.py</url>\r\n          <line>75</line>\r\n          <option name=\"timeStamp\" value=\"1\" />\r\n        </line-breakpoint>\r\n        <line-breakpoint enabled=\"true\" suspend=\"THREAD\" type=\"python-line\">\r\n          <url>file://$PROJECT_DIR$/Main.py</url>\r\n          <line>40</line>\r\n          <option name=\"timeStamp\" value=\"6\" />\r\n        </line-breakpoint>\r\n      </breakpoints>\r\n    </breakpoint-manager>\r\n  </component>\r\n  <component name=\"com.intellij.coverage.CoverageDataManagerImpl\">\r\n    <SUITE FILE_PATH=\"coverage/MLProject$preprocessing.coverage\" NAME=\"preprocessing Coverage Results\" MODIFIED=\"1755021248103\" SOURCE_PROVIDER=\"com.intellij.coverage.DefaultCoverageFileProvider\" RUNNER=\"coverage.py\" COVERAGE_BY_TEST_ENABLED=\"false\" COVERAGE_TRACING_ENABLED=\"false\" WORKING_DIRECTORY=\"$PROJECT_DIR$/src\" />\r\n    <SUITE FILE_PATH=\"coverage/MLProject$main.coverage\" NAME=\"main Coverage Results\" MODIFIED=\"1754581560655\" SOURCE_PROVIDER=\"com.intellij.coverage.DefaultCoverageFileProvider\" RUNNER=\"coverage.py\" COVERAGE_BY_TEST_ENABLED=\"false\" COVERAGE_TRACING_ENABLED=\"false\" WORKING_DIRECTORY=\"$PROJECT_DIR$/src\" />\r\n    <SUITE FILE_PATH=\"coverage/MLProject$Main.coverage\" NAME=\"Main Coverage Results\" MODIFIED=\"1754938084883\" SOURCE_PROVIDER=\"com.intellij.coverage.DefaultCoverageFileProvider\" RUNNER=\"coverage.py\" COVERAGE_BY_TEST_ENABLED=\"false\" COVERAGE_TRACING_ENABLED=\"false\" WORKING_DIRECTORY=\"$PROJECT_DIR$\" />\r\n    <SUITE FILE_PATH=\"coverage/MLProject$settings.coverage\" NAME=\"settings Coverage Results\" MODIFIED=\"1754582942222\" SOURCE_PROVIDER=\"com.intellij.coverage.DefaultCoverageFileProvider\" RUNNER=\"coverage.py\" COVERAGE_BY_TEST_ENABLED=\"false\" COVERAGE_TRACING_ENABLED=\"false\" WORKING_DIRECTORY=\"$PROJECT_DIR$\" />\r\n  </component>\r\n</project>
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/.idea/workspace.xml b/.idea/workspace.xml
+--- a/.idea/workspace.xml	(revision 90da7b09f610203b20c9fdeac27b31900d373ad4)
++++ b/.idea/workspace.xml	(date 1756718029883)
+@@ -5,8 +5,11 @@
+   </component>
+   <component name="ChangeListManager">
+     <list default="true" id="5b800ac8-4841-4f5e-b4d7-2ce2d271eeb7" name="Changes" comment="First commit">
+-      <change afterPath="$PROJECT_DIR$/src/Evaluate.py" afterDir="false" />
++      <change afterPath="$PROJECT_DIR$/src/XAI.py" afterDir="false" />
++      <change beforePath="$PROJECT_DIR$/.idea/misc.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/misc.xml" afterDir="false" />
+       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
++      <change beforePath="$PROJECT_DIR$/src/eval_pre_train.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/eval_pre_train.py" afterDir="false" />
++      <change beforePath="$PROJECT_DIR$/src/preprocessing.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/preprocessing.py" afterDir="false" />
+     </list>
+     <option name="SHOW_DIALOG" value="false" />
+     <option name="HIGHLIGHT_CONFLICTS" value="true" />
+@@ -34,12 +37,12 @@
+     &quot;assignee&quot;: &quot;BrandonTatani&quot;
+   }
+ }</component>
+-  <component name="GithubPullRequestsUISettings"><![CDATA[{
+-  "selectedUrlAndAccountId": {
+-    "url": "https://github.com/BrandonTatani/MLProject.git",
+-    "accountId": "f1c596c8-9a77-4d68-9287-e1fd66e6d6fe"
++  <component name="GithubPullRequestsUISettings">{
++  &quot;selectedUrlAndAccountId&quot;: {
++    &quot;url&quot;: &quot;https://github.com/BrandonTatani/MLProject.git&quot;,
++    &quot;accountId&quot;: &quot;f1c596c8-9a77-4d68-9287-e1fd66e6d6fe&quot;
+   }
+-}]]></component>
++}</component>
+   <component name="ProblemsViewState">
+     <option name="selectedTabId" value="CurrentFile" />
+   </component>
+@@ -51,28 +54,30 @@
+     <option name="hideEmptyMiddlePackages" value="true" />
+     <option name="showLibraryContents" value="true" />
+   </component>
+-  <component name="PropertiesComponent">{
+-  &quot;keyToString&quot;: {
+-    &quot;ModuleVcsDetector.initialDetectionPerformed&quot;: &quot;true&quot;,
+-    &quot;Python.Main.executor&quot;: &quot;Run&quot;,
+-    &quot;Python.eval_pre_train.executor&quot;: &quot;Run&quot;,
+-    &quot;Python.main.executor&quot;: &quot;Run&quot;,
+-    &quot;Python.preprocessing.executor&quot;: &quot;Run&quot;,
+-    &quot;Python.settings.executor&quot;: &quot;Run&quot;,
+-    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
+-    &quot;RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager&quot;: &quot;true&quot;,
+-    &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
+-    &quot;git-widget-placeholder&quot;: &quot;master&quot;,
+-    &quot;ignore.virus.scanning.warn.message&quot;: &quot;true&quot;,
+-    &quot;node.js.detected.package.eslint&quot;: &quot;true&quot;,
+-    &quot;node.js.detected.package.tslint&quot;: &quot;true&quot;,
+-    &quot;node.js.selected.package.eslint&quot;: &quot;(autodetect)&quot;,
+-    &quot;node.js.selected.package.tslint&quot;: &quot;(autodetect)&quot;,
+-    &quot;nodejs_package_manager_path&quot;: &quot;npm&quot;,
+-    &quot;settings.editor.selected.configurable&quot;: &quot;editor.preferences.fonts.default&quot;,
+-    &quot;vue.rearranger.settings.migration&quot;: &quot;true&quot;
++  <component name="PropertiesComponent"><![CDATA[{
++  "keyToString": {
++    "ModuleVcsDetector.initialDetectionPerformed": "true",
++    "Python.Main.executor": "Run",
++    "Python.XAI.executor": "Run",
++    "Python.eval_pre_train.executor": "Run",
++    "Python.main.executor": "Run",
++    "Python.preprocessing.executor": "Run",
++    "Python.settings.executor": "Run",
++    "RunOnceActivity.ShowReadmeOnStart": "true",
++    "RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager": "true",
++    "RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252": "true",
++    "RunOnceActivity.git.unshallow": "true",
++    "git-widget-placeholder": "master",
++    "ignore.virus.scanning.warn.message": "true",
++    "node.js.detected.package.eslint": "true",
++    "node.js.detected.package.tslint": "true",
++    "node.js.selected.package.eslint": "(autodetect)",
++    "node.js.selected.package.tslint": "(autodetect)",
++    "nodejs_package_manager_path": "npm",
++    "settings.editor.selected.configurable": "editor.preferences.fonts.default",
++    "vue.rearranger.settings.migration": "true"
+   }
+-}</component>
++}]]></component>
+   <component name="RecentsManager">
+     <key name="MoveFile.RECENT_KEYS">
+       <recent name="C:\Users\brand\Code\MLProject\src" />
+@@ -139,14 +144,20 @@
+           <url>file://$PROJECT_DIR$/Main.py</url>
+           <line>40</line>
+           <option name="timeStamp" value="6" />
++        </line-breakpoint>
++        <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
++          <url>file://$PROJECT_DIR$/src/Evaluate.py</url>
++          <option name="timeStamp" value="7" />
+         </line-breakpoint>
+       </breakpoints>
+     </breakpoint-manager>
+   </component>
+   <component name="com.intellij.coverage.CoverageDataManagerImpl">
+-    <SUITE FILE_PATH="coverage/MLProject$preprocessing.coverage" NAME="preprocessing Coverage Results" MODIFIED="1755021248103" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src" />
+-    <SUITE FILE_PATH="coverage/MLProject$main.coverage" NAME="main Coverage Results" MODIFIED="1754581560655" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src" />
++    <SUITE FILE_PATH="coverage/MLProject$preprocessing.coverage" NAME="preprocessing Coverage Results" MODIFIED="1756027659822" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src" />
++    <SUITE FILE_PATH="coverage/MLProject$eval_pre_train.coverage" NAME="eval_pre_train Coverage Results" MODIFIED="1756028621308" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src" />
++    <SUITE FILE_PATH="coverage/MLProject$settings.coverage" NAME="settings Coverage Results" MODIFIED="1755941478482" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src" />
+     <SUITE FILE_PATH="coverage/MLProject$Main.coverage" NAME="Main Coverage Results" MODIFIED="1754938084883" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+-    <SUITE FILE_PATH="coverage/MLProject$settings.coverage" NAME="settings Coverage Results" MODIFIED="1754582942222" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
++    <SUITE FILE_PATH="coverage/MLProject$main.coverage" NAME="main Coverage Results" MODIFIED="1754581560655" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src" />
++    <SUITE FILE_PATH="coverage/MLProject$XAI.coverage" NAME="XAI Coverage Results" MODIFIED="1756717814221" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src" />
+   </component>
+ </project>
+\ No newline at end of file
+Index: .idea/misc.xml
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.BaseRevisionTextPatchEP
+<+><?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n<project version=\"4\">\r\n  <component name=\"Black\">\r\n    <option name=\"sdkName\" value=\"Python 3.12 (MLProject)\" />\r\n  </component>\r\n  <component name=\"ProjectRootManager\" version=\"2\" project-jdk-name=\"Python 3.12 (MLProject)\" project-jdk-type=\"Python SDK\" />\r\n</project>
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/.idea/misc.xml b/.idea/misc.xml
+--- a/.idea/misc.xml	(revision 90da7b09f610203b20c9fdeac27b31900d373ad4)
++++ b/.idea/misc.xml	(date 1756717230219)
+@@ -4,4 +4,7 @@
+     <option name="sdkName" value="Python 3.12 (MLProject)" />
+   </component>
+   <component name="ProjectRootManager" version="2" project-jdk-name="Python 3.12 (MLProject)" project-jdk-type="Python SDK" />
++  <component name="PythonCompatibilityInspectionAdvertiser">
++    <option name="version" value="3" />
++  </component>
+ </project>
+\ No newline at end of file
+Index: src/XAI.py
+===================================================================
+diff --git a/src/XAI.py b/src/XAI.py
+new file mode 100644
+--- /dev/null	(date 1756717814180)
++++ b/src/XAI.py	(date 1756717814180)
+@@ -0,0 +1,517 @@
++#!/usr/bin/env python3
++"""
++XAI utilities for a fine-tuned BART medical summarizer.
++
++Features
++--------
++1) LIME explanations over the *input text* for the presence of a target
++   token/phrase in the model's generated summary.
++2) 2D visualization of encoder embeddings (token-level for a single
++   document and/or sentence-level for a corpus) using UMAP (if
++   available) or t-SNE as a fallback.
++
++Why this design?
++----------------
++LIME is natively geared toward classification. Summarization is
++sequence-to-sequence, so we wrap the model with a binary signal: whether
++its summary contains a chosen keyword/phrase (by default, we auto-choose
++from the model's own summary). LIME then tells us which *parts of the
++input* most influence the model into including that concept.
++
++Outputs
++-------
++- LIME plot:          outputs/<slug>_lime_explanation.png
++- Token embeddings:   outputs/<slug>_token_embeddings.png
++- Corpus embeddings:  outputs/<slug>_corpus_embeddings.png
++- Generated summary:  outputs/<slug>_summary.txt
++
++Example usage
++-------------
++# Explain a single text (English example)
++python xai.py \
++  --model_path ./checkpoints/bart-med-sum \
++  --text_file sample_input.txt \
++  --target_phrase "efficacia" \
++  --lime_samples 150 --lime_features 20
++
++# Token-level embedding viz for the same text
++python xai.py \
++  --model_path ./checkpoints/bart-med-sum \
++  --text_file sample_input.txt \
++  --plot_tokens
++
++# Sentence-level viz for a corpus (one doc per line)
++python xai.py \
++  --model_path ./checkpoints/bart-med-sum \
++  --corpus_file abstracts.txt \
++  --corpus_k 10
++
++"""
++from __future__ import annotations
++
++import argparse
++import os
++import re
++import sys
++import math
++import json
++import time
++import logging
++from functools import lru_cache
++from typing import List, Callable, Tuple, Optional, Dict
++
++import numpy as np
++import torch
++from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
++
++# LIME (make sure lime==0.2.0.1 or similar is installed)
++from lime.lime_text import LimeTextExplainer
++
++# Viz + reduction
++import matplotlib.pyplot as plt
++from sklearn.manifold import TSNE
++from sklearn.cluster import KMeans
++
++try:
++    import umap.umap_ as umap  # type: ignore
++    HAS_UMAP = True
++except Exception:
++    HAS_UMAP = False
++
++
++# -----------------------------
++# Utils
++# -----------------------------
++
++def set_seed(seed: int = 42):
++    np.random.seed(seed)
++    torch.manual_seed(seed)
++    torch.cuda.manual_seed_all(seed)
++
++
++def slugify(text: str, max_len: int = 40) -> str:
++    text = re.sub(r"\s+", " ", text.strip())
++    text = re.sub(r"[^\w\- ]", "", text, flags=re.UNICODE)
++    text = text.lower().strip().replace(" ", "-")
++    return text[:max_len] or f"run-{int(time.time())}"
++
++
++# Minimal Italian/English stopword list (kept tiny to avoid heavy deps)
++# Stopwords (language-aware). Keep lightweight, no external deps.
++STOPWORDS_EN = set(
++    """
++    a an the and or of to for in on with without between among over under within by is are was were be been being
++    this that these those from as at it its their his her our your my we you they me him them he she us
++    i ii iii iv v vi vii viii ix x
++    study studies paper article review background introduction objective objectives aim aims method methods methodology
++    material materials patients patient participants subjects cohort cohorts population populations sample samples
++    result results conclusion conclusions discussion discussions limitation limitations strength strengths
++    trial trials randomized randomised placebo double-blind multicenter multicentre week weeks day days month months
++    year years baseline follow-up significant significance pvalue p-values confidence interval ci hazard ratio hr
++    odds ratio or relative risk rr endpoint endpoints outcome outcomes primary secondary tertiary inclusion exclusion
++    clinical clinically disease diseases therapy therapies treatment treatments intervention interventions
++    """.split()
++)
++
++STOPWORDS_IT = set(
++    """
++    a ad al allo alla ai agli all agl all' alla' allo' con col coi da dal dallo della dei degli del dei degli
++    di da in nel nella nei negli nelle su sul sullo sulla sui sugli sulle per tra fra il lo la i gli le un una uno
++    e o ma come per tra fra da su con senza tra
++    """.split()
++)
++
++def get_stopwords(lang: str):
++    return STOPWORDS_EN if str(lang).lower().startswith("en") else STOPWORDS_IT
++
++
++
++def resolve_model_path(path: str) -> str:
++    """If `path` is a directory containing HF checkpoints (checkpoint-XXXX),
++    pick the latest by step; otherwise return the path unchanged."""
++    try:
++        if os.path.isdir(path):
++            cps = [d for d in os.listdir(path) if os.path.isdir(os.path.join(path, d)) and d.startswith("checkpoint-")]
++            if cps:
++                def step(d: str) -> int:
++                    m = re.search(r"checkpoint-(\d+)", d)
++                    return int(m.group(1)) if m else -1
++                best = sorted(cps, key=step)[-1]
++                return os.path.join(path, best)
++    except Exception:
++        pass
++    return path
++
++
++# -----------------------------
++# Summarizer wrapper
++# -----------------------------
++class BartSummarizer:
++    """Thin wrapper to generate summaries and expose encoder embeddings."""
++
++    def __init__(
++        self,
++        model_path: str,
++        device: Optional[str] = None,
++        max_input_len: int = 1024,
++        max_summary_len: int = 256,
++        num_beams: int = 4,
++        length_penalty: float = 1.0,
++        no_repeat_ngram_size: int = 3,
++        fp16: bool = True,
++    ):
++        self.model_path = model_path
++        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
++        self.model = AutoModelForSeq2SeqLM.from_pretrained(model_path)
++
++        if device is None:
++            device = "cuda" if torch.cuda.is_available() else "cpu"
++        self.device = device
++        self.model.to(self.device)
++        self.model.eval()
++
++        self.max_input_len = max_input_len
++        self.max_summary_len = max_summary_len
++        self.gen_kwargs = dict(
++            num_beams=num_beams,
++            length_penalty=length_penalty,
++            no_repeat_ngram_size=no_repeat_ngram_size,
++            max_new_tokens=max_summary_len,
++            do_sample=False,
++        )
++        self.fp16 = fp16 and (self.device == "cuda")
++
++        # Simple in-memory cache for summaries (speeds up LIME)
++        self._cache: Dict[str, str] = {}
++
++    @torch.no_grad()
++    def _generate_batch(self, texts: List[str]) -> List[str]:
++        if not texts:
++            return []
++        enc = self.tokenizer(
++            texts,
++            padding=True,
++            truncation=True,
++            max_length=self.max_input_len,
++            return_tensors="pt",
++        )
++        enc = {k: v.to(self.device) for k, v in enc.items()}
++        with torch.autocast(self.device if self.device != "cpu" else "cpu", enabled=self.fp16):
++            out_ids = self.model.generate(**enc, **self.gen_kwargs)
++        summaries = self.tokenizer.batch_decode(out_ids, skip_special_tokens=True)
++        return [s.strip() for s in summaries]
++
++    def summarize(self, text: str) -> str:
++        if text in self._cache:
++            return self._cache[text]
++        summary = self._generate_batch([text])[0]
++        self._cache[text] = summary
++        return summary
++
++    def summarize_many(self, texts: List[str]) -> List[str]:
++        # Use cache where possible, batch the rest.
++        missing_idx = [i for i, t in enumerate(texts) if t not in self._cache]
++        if missing_idx:
++            new_summaries = self._generate_batch([texts[i] for i in missing_idx])
++            for i, s in zip(missing_idx, new_summaries):
++                self._cache[texts[i]] = s
++        return [self._cache[t] for t in texts]
++
++    @torch.no_grad()
++    def encoder_token_embeddings(self, text: str) -> Tuple[np.ndarray, List[str]]:
++        """
++        Returns
++        -------
++        emb : (seq_len, hidden)
++        tokens : list[str]
++        """
++        enc = self.tokenizer(
++            text,
++            truncation=True,
++            max_length=self.max_input_len,
++            return_tensors="pt",
++            return_attention_mask=True,
++        )
++        enc = {k: v.to(self.device) for k, v in enc.items()}
++        outputs = self.model.model.encoder(**enc, output_hidden_states=False, return_dict=True)
++        last = outputs.last_hidden_state[0].detach().cpu().numpy()  # (seq_len, hidden)
++        tokens = self.tokenizer.convert_ids_to_tokens(enc["input_ids"][0].tolist())
++        # Remove special tokens (<s>, </s>, <pad>)
++        keep = [i for i, tok in enumerate(tokens) if tok not in {"<s>", "</s>", "<pad>"}]
++        return last[keep], [tokens[i] for i in keep]
++
++    @torch.no_grad()
++    def sentence_embedding(self, text: str, pool: str = "mean") -> np.ndarray:
++        embs, _ = self.encoder_token_embeddings(text)
++        if pool == "mean":
++            return embs.mean(axis=0)
++        elif pool == "max":
++            return embs.max(axis=0)
++        else:
++            raise ValueError("pool must be 'mean' or 'max'")
++
++
++# -----------------------------
++# LIME for summarization wrapper
++# -----------------------------
++class LimeForSummarization:
++    """
++    Uses LIME to explain which input tokens most influence the model to
++    include a target phrase in its summary.
++    """
++
++    def __init__(self, summarizer: BartSummarizer, class_names: Optional[List[str]] = None, stopwords: Optional[set] = None):
++        self.summarizer = summarizer
++        self.class_names = class_names or ["absent", "present"]
++        self.stopwords = stopwords if stopwords is not None else STOPWORDS_EN
++        self.explainer = LimeTextExplainer(class_names=self.class_names, bow=True)
++
++    def _auto_target_from_summary(self, summary: str) -> str:
++        # pick a salient, non-stopword token from the generated summary
++        toks = re.findall(r"\w+", summary.lower())
++        toks = [t for t in toks if t not in self.stopwords and len(t) > 3]
++        if not toks:
++            toks = re.findall(r"\w+", summary.lower()) or ["risultati"]
++        # choose most frequent token as default target
++        freq: Dict[str, int] = {}
++        for t in toks:
++            freq[t] = freq.get(t, 0) + 1
++        target = sorted(freq.items(), key=lambda x: (-x[1], x[0]))[0][0]
++        return target
++
++    def _build_predict_fn(self, target_phrase: str) -> Callable[[List[str]], np.ndarray]:
++        target_phrase_low = target_phrase.lower()
++
++        def predict(texts: List[str]) -> np.ndarray:
++            summaries = self.summarizer.summarize_many(texts)
++            scores = []
++            for s in summaries:
++                present = 1.0 if target_phrase_low in s.lower() else 0.0
++                scores.append([1.0 - present, present])  # [absent, present]
++            return np.array(scores, dtype=float)
++
++        return predict
++
++    def explain(
++        self,
++        input_text: str,
++        target_phrase: Optional[str] = None,
++        num_samples: int = 150,
++        num_features: int = 20,
++        seed: int = 42,
++        out_png_path: Optional[str] = None,
++    ) -> Tuple[str, str]:
++        """
++        Returns
++        -------
++        target_phrase: str
++        figure_path: str
++        """
++        set_seed(seed)
++        # Generate summary once to auto-pick a sensible target if needed
++        base_summary = self.summarizer.summarize(input_text)
++        if target_phrase is None:
++            target_phrase = self._auto_target_from_summary(base_summary)
++
++        predict_fn = self._build_predict_fn(target_phrase)
++        exp = self.explainer.explain_instance(
++            input_text,
++            predict_fn,
++            labels=[1],  # explain the 'present' class
++            num_samples=num_samples,
++            num_features=num_features,
++            random_state=seed,
++        )
++        fig = exp.as_pyplot_figure(label=1)
++        if out_png_path is None:
++            out_png_path = f"outputs/{slugify(input_text)}_lime_explanation.png"
++        os.makedirs(os.path.dirname(out_png_path), exist_ok=True)
++        fig.tight_layout()
++        fig.savefig(out_png_path, dpi=180)
++        plt.close(fig)
++
++        # Also save the base summary for reference
++        summ_path = f"outputs/{slugify(input_text)}_summary.txt"
++        with open(summ_path, "w", encoding="utf-8") as f:
++            f.write(base_summary + "\n")
++
++        return target_phrase, out_png_path
++
++
++# -----------------------------
++# Embedding visualizations
++# -----------------------------
++
++def reduce_2d(X: np.ndarray, random_state: int = 42) -> np.ndarray:
++    if HAS_UMAP and X.shape[0] >= 10:
++        reducer = umap.UMAP(n_neighbors=min(15, max(2, X.shape[0] // 3)), min_dist=0.1, metric="cosine", random_state=random_state)
++        return reducer.fit_transform(X)
++    # TSNE fallback (perplexity must be < n_samples)
++    perpl = max(5, min(30, (X.shape[0] - 1) // 3))
++    return TSNE(n_components=2, perplexity=perpl, init="random", learning_rate="auto", random_state=random_state).fit_transform(X)
++
++
++def plot_token_embeddings(
++    summarizer: BartSummarizer,
++    text: str,
++    out_png_path: Optional[str] = None,
++    random_state: int = 42,
++):
++    embs, toks = summarizer.encoder_token_embeddings(text)
++    Z = reduce_2d(embs, random_state=random_state)
++
++    if out_png_path is None:
++        out_png_path = f"outputs/{slugify(text)}_token_embeddings.png"
++    os.makedirs(os.path.dirname(out_png_path), exist_ok=True)
++
++    plt.figure(figsize=(10, 8))
++    plt.scatter(Z[:, 0], Z[:, 1], s=30, alpha=0.6)
++    # annotate (limit annotations if many tokens)
++    max_annot = 120
++    for i, tok in enumerate(toks[:max_annot]):
++        plt.annotate(tok, (Z[i, 0], Z[i, 1]), fontsize=8, alpha=0.8)
++    if len(toks) > max_annot:
++        plt.title(f"Token embeddings (showing first {max_annot} / {len(toks)} tokens)")
++    else:
++        plt.title("Token embeddings")
++    plt.tight_layout()
++    plt.savefig(out_png_path, dpi=180)
++    plt.close()
++
++
++def plot_corpus_embeddings(
++    summarizer: BartSummarizer,
++    docs: List[str],
++    out_png_path: str,
++    k: int = 8,
++    random_state: int = 42,
++):
++    docs = [d.strip() for d in docs if d and d.strip()]
++    if not docs:
++        raise ValueError("No documents provided for corpus embedding plot.")
++
++    embs = np.stack([summarizer.sentence_embedding(d) for d in docs])
++    Z = reduce_2d(embs, random_state=random_state)
++
++    # optional clustering just for coloring/legend
++    k = min(k, max(1, len(docs)))
++    kmeans = KMeans(n_clusters=k, n_init=10, random_state=random_state)
++    labels = kmeans.fit_predict(embs) if len(docs) >= k else np.zeros(len(docs), dtype=int)
++
++    os.makedirs(os.path.dirname(out_png_path), exist_ok=True)
++
++    plt.figure(figsize=(10, 8))
++    for lab in sorted(set(labels)):
++        idx = np.where(labels == lab)[0]
++        plt.scatter(Z[idx, 0], Z[idx, 1], s=40, alpha=0.7, label=f"cluster {lab}")
++    # annotate a few points (first N)
++    max_ann = min(30, len(docs))
++    for i in range(max_ann):
++        preview = docs[i][:40].replace("\n", " ")
++        plt.annotate(preview + ("…" if len(docs[i]) > 40 else ""), (Z[i, 0], Z[i, 1]), fontsize=8, alpha=0.8)
++
++    plt.legend(loc="best")
++    plt.title("Sentence-level encoder embeddings")
++    plt.tight_layout()
++    plt.savefig(out_png_path, dpi=180)
++    plt.close()
++
++
++# -----------------------------
++# CLI
++# -----------------------------
++
++def parse_args() -> argparse.Namespace:
++    p = argparse.ArgumentParser(description="XAI + embeddings for BART medical summarizer")
++
++    # Model
++    p.add_argument("--model_path", type=str, required=True, help="Path or HF hub id for the fine-tuned BART model")
++    p.add_argument("--device", type=str, default=None, help="cuda or cpu (auto by default)")
++    p.add_argument("--max_input_len", type=int, default=1024)
++    p.add_argument("--max_summary_len", type=int, default=256)
++    p.add_argument("--lang", type=str, default="en", choices=["en", "it"], help="Language for stopwords used in auto target selection")
++
++    # Data input
++    p.add_argument("--text", type=str, default=None, help="Single input text (overrides --text_file)")
++    p.add_argument("--text_file", type=str, default=None, help="File with a single input text")
++
++    # LIME
++    p.add_argument("--target_phrase", type=str, default=None, help="Target token/phrase to check for in the summary (auto-chosen if omitted)")
++    p.add_argument("--lime_samples", type=int, default=150)
++    p.add_argument("--lime_features", type=int, default=20)
++    p.add_argument("--seed", type=int, default=42)
++
++    # Embedding plots
++    p.add_argument("--plot_tokens", action="store_true", help="Create token-level embedding plot for the provided --text/--text_file")
++    p.add_argument("--corpus_file", type=str, default=None, help="Text file with one document per line for sentence-level plot")
++    p.add_argument("--corpus_k", type=int, default=8, help="Number of k-means clusters for the corpus plot")
++
++    return p.parse_args()
++
++
++def read_text_from_args(args: argparse.Namespace) -> Optional[str]:
++    if args.text is not None:
++        return args.text
++    if args.text_file is not None:
++        with open(args.text_file, "r", encoding="utf-8") as f:
++            return f.read()
++    return None
++
++
++def main():
++    args = parse_args()
++
++    # Build summarizer
++    summarizer = BartSummarizer(
++        model_path=resolve_model_path(args.model_path),
++        device=args.device,
++        max_input_len=args.max_input_len,
++        max_summary_len=args.max_summary_len,
++    )
++
++    single_text = read_text_from_args(args)
++
++    if single_text:
++        slug = slugify(single_text)
++        os.makedirs("outputs", exist_ok=True)
++
++        # 1) LIME explanation (optional target auto-selected)
++        stopwords = get_stopwords(args.lang)
++        lime = LimeForSummarization(summarizer, stopwords=stopwords)
++        target, fig_path = lime.explain(
++            single_text,
++            target_phrase=args.target_phrase,
++            num_samples=args.lime_samples,
++            num_features=args.lime_features,
++            seed=args.seed,
++        )
++        print(f"[LIME] target phrase: '{target}' -> {fig_path}")
++        print(f"[LIME] summary saved at outputs/{slug}_summary.txt")
++
++        # 2) Token-level embedding plot (if requested)
++        if args.plot_tokens:
++            token_png = f"outputs/{slug}_token_embeddings.png"
++            plot_token_embeddings(summarizer, single_text, token_png, random_state=args.seed)
++            print(f"[EMB] token-level plot -> {token_png}")
++
++    # 3) Sentence-level embedding plot for a corpus
++    if args.corpus_file is not None:
++        with open(args.corpus_file, "r", encoding="utf-8") as f:
++            docs = [line.rstrip("\n") for line in f]
++        corpus_png = f"outputs/{slugify(docs[0] if docs else 'corpus')}_corpus_embeddings.png"
++        plot_corpus_embeddings(
++            summarizer,
++            docs,
++            out_png_path=corpus_png,
++            k=args.corpus_k,
++            random_state=args.seed,
++        )
++        print(f"[EMB] corpus-level plot -> {corpus_png}")
++
++    if not single_text and args.corpus_file is None:
++        print("Nothing to do. Provide --text/--text_file and/or --corpus_file.")
++
++
++if __name__ == "__main__":
++    main()
++

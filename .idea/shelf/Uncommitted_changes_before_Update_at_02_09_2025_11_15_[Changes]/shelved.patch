@@ -1,0 +1,17 @@
+Index: src/eval_pre_train.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.BaseRevisionTextPatchEP
+<+>from settings import *\r\nfrom transformers import DataCollatorForSeq2Seq, AutoModelForSeq2SeqLM, AutoTokenizer, Trainer, Seq2SeqTrainer, Seq2SeqTrainingArguments\r\nfrom preprocessing import Preprocessor, tokenizer, model\r\nimport evaluate\r\nfrom tqdm import tqdm\r\n\r\n#pip install absl-py nltk rouge-score\r\n#pip install \"accelerate>=0.26.0\"\r\n#pip install --upgrade transformers datasets evaluate accelerate\r\n#pip install --upgrade \"transformers>=4.39.0\" \"accelerate>=0.26.0\" datasets evaluate\r\n\r\n#pip freeze > requirements.txt\r\n\r\n#Inizializzazione\r\npreprocess = Preprocessor()\r\n\r\n# Utilizzare il DataCollator per generare batch uniformi\r\ndata_collator = DataCollatorForSeq2Seq(\r\n    tokenizer=tokenizer,\r\n    model=model,\r\n    label_pad_token_id=-100,\r\n)\r\n\r\n#ROUGE per valutare il modello BART pre-trained\r\nrouge = evaluate.load(\"rouge\")\r\n\r\ndef compute_metrics(eval_pred):\r\n    predictions, labels = eval_pred\r\n\r\n    # Decodifica i token in testo leggibile\r\n    decoded_preds = tokenizer.batch_decode(predictions, skip_special_tokens=True)\r\n    decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)\r\n\r\n    # Calcolo ROUGE\r\n    result = rouge.compute(predictions=decoded_preds, references=decoded_labels, use_aggregator = False)\r\n\r\n    result = {k: round(v * 100, 2) for k, v in result.items()}\r\n\r\n    return result\r\n\r\nif __name__ == \"__main__\":\r\n    eval_dataset = preprocess.splits['validation']\r\n\r\ntraining_args = Seq2SeqTrainingArguments(\r\n    output_dir=\"./results\",\r\n    per_device_eval_batch_size=4,\r\n    predict_with_generate=True,\r\n    do_train=False,\r\n    do_eval=True,\r\n    logging_dir=\"./logs\",\r\n)\r\n\r\n# Inizializza il trainer\r\ntrainer = Seq2SeqTrainer(\r\n    model=model,\r\n    args=training_args,\r\n    tokenizer=tokenizer,\r\n    data_collator=data_collator,\r\n    compute_metrics=compute_metrics,\r\n    eval_dataset=eval_dataset,\r\n)\r\n\r\n# Valutazione\r\nmetrics = trainer.evaluate()\r\nprint(\"\uD83D\uDCCA Risultati ROUGE (con Seq2SeqTrainer):\", metrics)
+===================================================================
+diff --git a/src/eval_pre_train.py b/src/eval_pre_train.py
+--- a/src/eval_pre_train.py	(revision 90da7b09f610203b20c9fdeac27b31900d373ad4)
++++ b/src/eval_pre_train.py	(date 1756027927917)
+@@ -39,7 +39,7 @@
+     return result
+ 
+ if __name__ == "__main__":
+-    eval_dataset = preprocess.splits['validation']
++    eval_dataset = preprocess.test()
+ 
+ training_args = Seq2SeqTrainingArguments(
+     output_dir="./results",
